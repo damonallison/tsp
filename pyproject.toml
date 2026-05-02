@@ -5,3 +5,8 @@ description = "An example VRP "
 readme = "README.md"
 requires-python = ">=3.13.13"
 dependencies = ["ortools>=9.15.6755"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
