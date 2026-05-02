@@ -1,0 +1,7 @@
+[project]
+name = "tsp"
+version = "0.1.0"
+description = "An example VRP "
+readme = "README.md"
+requires-python = ">=3.13.13"
+dependencies = ["ortools>=9.15.6755"]

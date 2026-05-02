@@ -1,142 +1,17 @@
-"""Route optimisation: deadline-aware nearest-neighbour + 2-opt TSP/VRP solver."""
+"""Route optimisation using Google OR-Tools constraint solver (VRP with time windows)."""
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import List, Tuple
 
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
 from .models import AVERAGE_SPEED_MPH, Driver, Package, Route, Stop
 
-
-# ---------------------------------------------------------------------------
-# Low-level route-building helpers
-# ---------------------------------------------------------------------------
-
-
-def _route_distance(start_x: float, start_y: float, packages: List[Package]) -> float:
-    """Total Euclidean distance of a route starting at *(start_x, start_y)*."""
-    if not packages:
-        return 0.0
-    import math
-
-    def dist(ax: float, ay: float, bx: float, by: float) -> float:
-        return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
-
-    total = dist(start_x, start_y, packages[0].destination.x, packages[0].destination.y)
-    for i in range(len(packages) - 1):
-        a = packages[i].destination
-        b = packages[i + 1].destination
-        total += dist(a.x, a.y, b.x, b.y)
-    return total
-
-
-def _deadline_aware_nearest_neighbor(
-    start_x: float,
-    start_y: float,
-    packages: List[Package],
-    start_time: datetime,
-    speed_mph: float = AVERAGE_SPEED_MPH,
-) -> List[Package]:
-    """
-    Build an initial route using a deadline-aware nearest-neighbour heuristic.
-
-    At every step the algorithm picks the *most urgent* package that can still
-    be reached on time.  When no feasible package exists it falls back to the
-    geographically nearest remaining package.
-    """
-    import math
-
-    remaining = list(packages)
-    order: List[Package] = []
-    cx, cy = start_x, start_y
-    current_time = start_time
-
-    while remaining:
-        feasible = []
-        for pkg in remaining:
-            dx = cx - pkg.destination.x
-            dy = cy - pkg.destination.y
-            travel_h = math.sqrt(dx * dx + dy * dy) / speed_mph
-            if current_time + timedelta(hours=travel_h) <= pkg.arrive_by:
-                feasible.append(pkg)
-
-        candidates = feasible if feasible else remaining
-        # Primary key: deadline (most urgent first);  tie-break: distance
-        next_pkg = min(
-            candidates,
-            key=lambda p: (
-                p.arrive_by,
-                math.sqrt((cx - p.destination.x) ** 2 + (cy - p.destination.y) ** 2),
-            ),
-        )
-
-        order.append(next_pkg)
-        dx = cx - next_pkg.destination.x
-        dy = cy - next_pkg.destination.y
-        travel_h = math.sqrt(dx * dx + dy * dy) / speed_mph
-        current_time += timedelta(hours=travel_h)
-        cx, cy = next_pkg.destination.x, next_pkg.destination.y
-        remaining.remove(next_pkg)
-
-    return order
-
-
-def _two_opt(
-    start_x: float,
-    start_y: float,
-    packages: List[Package],
-    start_time: datetime,
-    speed_mph: float = AVERAGE_SPEED_MPH,
-) -> List[Package]:
-    """
-    Improve a route using 2-opt swaps.
-
-    A swap is accepted only when it *reduces total distance* **and** the
-    resulting route still satisfies every delivery deadline.
-    """
-    if len(packages) <= 2:
-        return packages
-
-    best = list(packages)
-    best_dist = _route_distance(start_x, start_y, best)
-    improved = True
-
-    while improved:
-        improved = False
-        for i in range(len(best) - 1):
-            for j in range(i + 2, len(best)):
-                candidate = best[: i + 1] + best[i + 1 : j + 1][::-1] + best[j + 1 :]
-                cand_dist = _route_distance(start_x, start_y, candidate)
-                if cand_dist < best_dist - 1e-10:
-                    # Validate deadlines before accepting the swap
-                    if _deadlines_satisfied(start_x, start_y, candidate, start_time, speed_mph):
-                        best = candidate
-                        best_dist = cand_dist
-                        improved = True
-    return best
-
-
-def _deadlines_satisfied(
-    start_x: float,
-    start_y: float,
-    packages: List[Package],
-    start_time: datetime,
-    speed_mph: float = AVERAGE_SPEED_MPH,
-) -> bool:
-    """Return True when every package in the ordered list can be delivered on time."""
-    import math
-
-    cx, cy = start_x, start_y
-    current_time = start_time
-    for pkg in packages:
-        dx = cx - pkg.destination.x
-        dy = cy - pkg.destination.y
-        travel_h = math.sqrt(dx * dx + dy * dy) / speed_mph
-        current_time += timedelta(hours=travel_h)
-        if current_time > pkg.arrive_by:
-            return False
-        cx, cy = pkg.destination.x, pkg.destination.y
-    return True
+# Scale factor: convert float miles to integer distance units (milli-miles).
+_DIST_SCALE = 1_000
 
 
 def _build_route(
@@ -146,19 +21,16 @@ def _build_route(
     speed_mph: float = AVERAGE_SPEED_MPH,
 ) -> Route:
     """Construct a :class:`Route` object with computed arrival times."""
-    import math
-
     route = Route(driver=driver)
     cx, cy = driver.depot.x, driver.depot.y
     current_time = start_time
 
     for pkg in packages:
-        dx = cx - pkg.destination.x
-        dy = cy - pkg.destination.y
-        distance = math.sqrt(dx * dx + dy * dy)
+        distance = math.sqrt(
+            (cx - pkg.destination.x) ** 2 + (cy - pkg.destination.y) ** 2
+        )
         travel_h = distance / speed_mph
         arrival_time = current_time + timedelta(hours=travel_h)
-
         route.stops.append(
             Stop(
                 package=pkg,
@@ -166,11 +38,150 @@ def _build_route(
                 distance_from_previous=distance,
             )
         )
-
         cx, cy = pkg.destination.x, pkg.destination.y
         current_time = arrival_time
 
     return route
+
+
+def _solve_routing(
+    packages: List[Package],
+    drivers: List[Driver],
+    start_time: datetime,
+    speed_mph: float,
+    allow_drops: bool,
+    time_limit_seconds: int,
+) -> Tuple[List[Route], List[Package]]:
+    """
+    Core OR-Tools VRP solver.
+
+    Node 0 is the shared depot; nodes 1..n map to *packages* in order.
+    When *allow_drops* is True each package node gets a high-penalty disjunction
+    so it can be left unserved rather than making the problem infeasible.
+    """
+    if not packages or not drivers:
+        return [], list(packages)
+
+    depot = drivers[0].depot
+    locs: List[Tuple[float, float]] = [(depot.x, depot.y)] + [
+        (p.destination.x, p.destination.y) for p in packages
+    ]
+    n = len(locs)
+    num_vehicles = len(drivers)
+
+    # Integer distance matrix (milli-miles).
+    dist_matrix = [
+        [
+            round(
+                math.sqrt(
+                    (locs[i][0] - locs[j][0]) ** 2 + (locs[i][1] - locs[j][1]) ** 2
+                )
+                * _DIST_SCALE
+            )
+            for j in range(n)
+        ]
+        for i in range(n)
+    ]
+
+    # Integer time matrix (seconds).
+    time_matrix = [
+        [
+            round(
+                math.sqrt(
+                    (locs[i][0] - locs[j][0]) ** 2 + (locs[i][1] - locs[j][1]) ** 2
+                )
+                / speed_mph
+                * 3600
+            )
+            for j in range(n)
+        ]
+        for i in range(n)
+    ]
+
+    # Time windows [earliest, latest] in seconds from start_time.
+    horizon = 10 * 24 * 3600  # 10-day fallback horizon
+    time_windows: List[Tuple[int, int]] = [(0, horizon)]  # depot
+    for pkg in packages:
+        deadline_s = int((pkg.arrive_by - start_time).total_seconds())
+        time_windows.append((0, max(1, deadline_s)))
+
+    # Capacity in cubic inches (integer).
+    demands = [0] + [int(round(p.size_cubic_inches)) for p in packages]
+    vehicle_capacities = [int(round(d.vehicle_size_cubic_inches)) for d in drivers]
+
+    manager = pywrapcp.RoutingIndexManager(n, num_vehicles, 0)
+    routing = pywrapcp.RoutingModel(manager)
+
+    # Arc-cost callback (distance objective).
+    def dist_cb(from_idx: int, to_idx: int) -> int:
+        return dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
+
+    dist_cb_idx = routing.RegisterTransitCallback(dist_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
+
+    # Fixed cost per active vehicle to encourage using fewer drivers.
+    routing.SetFixedCostOfAllVehicles(100_000 * _DIST_SCALE)
+
+    # Time dimension (enforces delivery deadlines).
+    def time_cb(from_idx: int, to_idx: int) -> int:
+        return time_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
+
+    time_cb_idx = routing.RegisterTransitCallback(time_cb)
+    routing.AddDimension(time_cb_idx, horizon, horizon, False, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
+    for node_i, (tw_start, tw_end) in enumerate(time_windows):
+        time_dim.CumulVar(manager.NodeToIndex(node_i)).SetRange(tw_start, tw_end)
+    for v in range(num_vehicles):
+        routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.Start(v)))
+        routing.AddVariableMinimizedByFinalizer(time_dim.CumulVar(routing.End(v)))
+
+    # Capacity dimension.
+    def demand_cb(from_idx: int) -> int:
+        return demands[manager.IndexToNode(from_idx)]
+
+    demand_cb_idx = routing.RegisterUnaryTransitCallback(demand_cb)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_cb_idx, 0, vehicle_capacities, True, "Capacity"
+    )
+
+    # Optional: allow unserved packages (VRP mode with penalty).
+    if allow_drops:
+        drop_penalty = 1_000_000_000
+        for node in range(1, n):
+            routing.AddDisjunction([manager.NodeToIndex(node)], drop_penalty)
+
+    # Search parameters.
+    params = pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    if time_limit_seconds > 0:
+        params.local_search_metaheuristic = (
+            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        )
+        params.time_limit.seconds = time_limit_seconds
+
+    solution = routing.SolveWithParameters(params)
+    if solution is None:
+        return [], list(packages)
+
+    # Extract routes from the solution.
+    routes: List[Route] = []
+    assigned_ids: set = set()
+    for v, driver in enumerate(drivers):
+        idx = routing.Start(v)
+        sequence: List[Package] = []
+        while not routing.IsEnd(idx):
+            node = manager.IndexToNode(idx)
+            if node != 0:
+                sequence.append(packages[node - 1])
+                assigned_ids.add(packages[node - 1].id)
+            idx = solution.Value(routing.NextVar(idx))
+        if sequence:
+            routes.append(_build_route(driver, sequence, start_time, speed_mph))
+
+    unassigned = [p for p in packages if p.id not in assigned_ids]
+    return routes, unassigned
 
 
 # ---------------------------------------------------------------------------
@@ -185,23 +196,27 @@ def calculate_route(
     speed_mph: float = AVERAGE_SPEED_MPH,
 ) -> Route:
     """
-    Return an optimised :class:`Route` for *driver* to deliver *packages*
-    starting at *start_time*.
+    Return an OR-Tools optimised :class:`Route` for *driver* to deliver
+    *packages* starting at *start_time*.
 
-    The algorithm:
-
-    1. Deadline-aware nearest-neighbour for an initial ordering.
-    2. 2-opt improvement (deadline-safe swaps only).
-    3. Build and return the :class:`Route` with exact arrival times.
+    Uses a single-vehicle TSP with time-window constraints.  If the solver
+    cannot find a feasible ordering the packages are delivered in their
+    original order.
     """
     if not packages:
         return Route(driver=driver)
 
-    order = _deadline_aware_nearest_neighbor(
-        driver.depot.x, driver.depot.y, packages, start_time, speed_mph
+    routes, _ = _solve_routing(
+        packages,
+        [driver],
+        start_time,
+        speed_mph,
+        allow_drops=False,
+        time_limit_seconds=0,
     )
-    order = _two_opt(driver.depot.x, driver.depot.y, order, start_time, speed_mph)
-    return _build_route(driver, order, start_time, speed_mph)
+    return (
+        routes[0] if routes else _build_route(driver, packages, start_time, speed_mph)
+    )
 
 
 def assign_packages_to_drivers(
@@ -211,14 +226,11 @@ def assign_packages_to_drivers(
     speed_mph: float = AVERAGE_SPEED_MPH,
 ) -> Tuple[List[Route], List[Package]]:
     """
-    Assign packages to drivers and compute optimised routes.
+    Assign packages to drivers and compute optimised routes using OR-Tools VRP.
 
-    **Optimisation goals** (in priority order):
-
-    1. Earliest deliveries — urgent packages are assigned first so that they
-       reach their destination as early as possible.
-    2. Minimal drivers — a new driver is only enlisted when no existing driver's
-       route can accommodate the package (capacity **and** deadline constraints).
+    Enforces capacity and time-window (deadline) constraints across all
+    vehicles simultaneously.  Packages that cannot be served within any
+    constraint are returned as *unassigned*.
 
     Returns
     -------
@@ -227,62 +239,6 @@ def assign_packages_to_drivers(
     unassigned : list of :class:`Package`
         Packages that could not be routed within any constraint.
     """
-    # Sort by deadline ascending — most urgent packages are processed first.
-    sorted_packages = sorted(packages, key=lambda p: p.arrive_by)
-
-    # Use a list of (driver, packages) pairs to avoid dict-key hashing issues.
-    assignments: List[Tuple[Driver, List[Package]]] = []
-    available_drivers = list(drivers)
-    unassigned: List[Package] = []
-
-    for package in sorted_packages:
-        placed = False
-
-        # Try existing drivers first (minimise driver count).
-        for i, (driver, current_pkgs) in enumerate(assignments):
-            candidate_pkgs = current_pkgs + [package]
-
-            # Capacity check (fast, no route calculation needed).
-            total_volume = sum(p.size_cubic_inches for p in candidate_pkgs)
-            if total_volume > driver.vehicle_size_cubic_inches:
-                continue
-
-            # Full validity check (recompute route with the new package).
-            test_route = calculate_route(driver, candidate_pkgs, start_time, speed_mph)
-            if test_route.is_valid():
-                assignments[i] = (driver, candidate_pkgs)
-                placed = True
-                break
-
-        if placed:
-            continue
-
-        # Enlist a new driver.
-        while available_drivers:
-            new_driver = available_drivers.pop(0)
-
-            # Can the package physically fit in this vehicle?
-            if package.size_cubic_inches > new_driver.vehicle_size_cubic_inches:
-                continue  # try next driver
-
-            # Can this single package be delivered on time?
-            test_route = calculate_route(new_driver, [package], start_time, speed_mph)
-            if test_route.is_valid():
-                assignments.append((new_driver, [package]))
-                placed = True
-                break
-            # Package cannot be delivered on time even by a fresh driver —
-            # skip this driver and put it back since it might still be
-            # useful for other packages.
-            available_drivers.insert(0, new_driver)
-            break
-
-        if not placed:
-            unassigned.append(package)
-
-    # Build final optimised routes.
-    final_routes: List[Route] = [
-        calculate_route(driver, pkgs, start_time, speed_mph)
-        for driver, pkgs in assignments
-    ]
-    return final_routes, unassigned
+    return _solve_routing(
+        packages, drivers, start_time, speed_mph, allow_drops=True, time_limit_seconds=5
+    )
