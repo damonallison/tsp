@@ -168,3 +168,40 @@ class TestAssignPackagesToDrivers(unittest.TestCase):
         routes, unassigned = assign_packages_to_drivers([pkg], [driver], self.now)
         self.assertEqual(len(unassigned), 0)
         self.assertEqual(len(routes), 1)
+
+
+class TestSolveRoutingNoSolution(unittest.TestCase):
+    """Test the ``solution is None`` fallback inside ``_solve_routing``."""
+
+    def setUp(self):
+        self.depot = Location("Depot", 0, 0)
+        self.now = datetime(2024, 1, 1, 8, 0, 0)
+
+    def test_infeasible_time_window_returns_empty_routes(self):
+        """
+        Force OR-Tools to return no solution by giving a package whose
+        deadline is in the past.  The time window becomes [0, 1] second
+        while the travel time to the far location is ~120 000 seconds,
+        making the problem provably infeasible with ``allow_drops=False``.
+        The ``if solution is None`` branch in ``_solve_routing`` must fire.
+        """
+        from tsp.optimizer import _solve_routing  # noqa: PLC0415
+
+        driver = Driver("d1", 70.0, self.depot)
+        # Deadline 10 h in the past → deadline_s < 0 → max(1, deadline_s) == 1
+        # Package is 1 000 miles away → travel ≈ 120 000 s  ⟹  infeasible
+        far_loc = Location("Far", 1000, 0)
+        past_deadline = self.now - timedelta(hours=10)
+        pkg = Package("p1", 500.0, past_deadline, far_loc)
+
+        routes, unassigned = _solve_routing(
+            [pkg],
+            [driver],
+            self.now,
+            speed_mph=30.0,
+            allow_drops=False,
+            time_limit_seconds=0,
+        )
+        self.assertEqual(routes, [])
+        self.assertEqual(len(unassigned), 1)
+        self.assertEqual(unassigned[0].id, "p1")

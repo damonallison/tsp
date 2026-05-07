@@ -1,9 +1,11 @@
 """Unit tests for tsp.solver.Solver."""
 
+import contextlib
+import io
 import unittest
 from datetime import datetime, timedelta
 
-from tsp.models import Location, Package
+from tsp.models import Driver, Location, Package, Route, Stop
 from tsp.solver import Solver
 
 
@@ -113,3 +115,135 @@ class TestSolverSolve(unittest.TestCase):
                 [],
                 f"{route.driver.id} has deadline violations",
             )
+
+
+class TestSolverPrintSolution(unittest.TestCase):
+    """Tests for Solver.print_solution() — exercises all output branches."""
+
+    def setUp(self):
+        self.depot = Location("Depot", 25, 25)
+        self.now = datetime(2024, 6, 1, 8, 0, 0)
+        self.solver = Solver(depot=self.depot, num_drivers=2, seed=0)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _capture(self, routes, unassigned) -> str:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.solver.print_solution(routes, unassigned)
+        return buf.getvalue()
+
+    def _make_stop(
+        self,
+        pkg_id: str,
+        deadline_offset_hours: float,
+        arrival_offset_hours: float,
+        loc_name: str = "Loc",
+        loc_x: float = 30.0,
+        loc_y: float = 25.0,
+        size: float = 500.0,
+        dist: float = 5.0,
+    ) -> Stop:
+        loc = Location(loc_name, loc_x, loc_y)
+        pkg = Package(pkg_id, size, self.now + timedelta(hours=deadline_offset_hours), loc)
+        return Stop(
+            package=pkg,
+            arrival_time=self.now + timedelta(hours=arrival_offset_hours),
+            distance_from_previous=dist,
+        )
+
+    # ------------------------------------------------------------------
+    # Header / summary
+    # ------------------------------------------------------------------
+
+    def test_header_printed_for_empty_solution(self):
+        output = self._capture([], [])
+        self.assertIn("TSP Package Routing Solution", output)
+        self.assertIn("Drivers dispatched : 0", output)
+        self.assertIn("Packages routed    : 0", output)
+        self.assertIn("Unassigned packages: 0", output)
+
+    # ------------------------------------------------------------------
+    # On-time vs. late stop markers (✓ / ✗)
+    # ------------------------------------------------------------------
+
+    def test_on_time_stop_prints_checkmark(self):
+        """Arrival before deadline prints ✓ and no deadline-violation line."""
+        driver = self.solver.drivers[0]
+        stop = self._make_stop("p1", deadline_offset_hours=24, arrival_offset_hours=1)
+        route = Route(driver=driver, stops=[stop])
+
+        output = self._capture([route], [])
+        self.assertIn("✓", output)
+        self.assertNotIn("✗", output)
+        self.assertNotIn("Deadline violations", output)
+
+    def test_late_stop_prints_cross_and_violation_list(self):
+        """Arrival after deadline prints ✗ and a Deadline violations line."""
+        driver = self.solver.drivers[0]
+        # Arrives 3 h after the 1 h deadline
+        stop = self._make_stop("p2", deadline_offset_hours=1, arrival_offset_hours=3)
+        route = Route(driver=driver, stops=[stop])
+
+        output = self._capture([route], [])
+        self.assertIn("✗", output)
+        self.assertIn("Deadline violations", output)
+        self.assertIn("p2", output)
+
+    def test_mixed_stops_print_both_markers(self):
+        """One on-time and one late stop → both ✓ and ✗ appear."""
+        driver = self.solver.drivers[0]
+        on_time = self._make_stop(
+            "on", deadline_offset_hours=24, arrival_offset_hours=1,
+            loc_name="OnTime", loc_x=29.0,
+        )
+        late = self._make_stop(
+            "late", deadline_offset_hours=1, arrival_offset_hours=3,
+            loc_name="Late", loc_x=31.0,
+        )
+        route = Route(driver=driver, stops=[on_time, late])
+
+        output = self._capture([route], [])
+        self.assertIn("✓", output)
+        self.assertIn("✗", output)
+
+    # ------------------------------------------------------------------
+    # Unassigned packages branch
+    # ------------------------------------------------------------------
+
+    def test_unassigned_packages_section_printed(self):
+        loc = Location("Unassigned", 35, 25)
+        pkg = Package("u1", 500.0, self.now + timedelta(hours=24), loc)
+
+        output = self._capture([], [pkg])
+        self.assertIn("Unassigned packages:", output)
+        self.assertIn("u1", output)
+
+    def test_no_unassigned_section_when_empty(self):
+        output = self._capture([], [])
+        # The summary line always reads "Unassigned packages: 0".
+        # The *section* header is printed as "\nUnassigned packages:\n" (no trailing number).
+        self.assertNotIn("\nUnassigned packages:\n", output)
+
+    # ------------------------------------------------------------------
+    # Zero vehicle-size guard  (``if driver.vehicle_size_cubic_feet else 0``)
+    # ------------------------------------------------------------------
+
+    def test_zero_vehicle_size_guard_yields_zero_percent(self):
+        """
+        When vehicle_size_cubic_feet is forced to 0 after construction the
+        ``else 0`` branch of the used_pct ternary must execute without
+        raising a ZeroDivisionError, and the output must show 0%.
+        """
+        driver = Driver("d_zero", 50.0, self.depot)
+        # Driver is a non-frozen dataclass: we can override the field directly.
+        driver.vehicle_size_cubic_feet = 0
+
+        stop = self._make_stop("p3", deadline_offset_hours=24, arrival_offset_hours=1)
+        route = Route(driver=driver, stops=[stop])
+
+        output = self._capture([route], [])
+        # used_pct is computed as 0 when vehicle_size_cubic_feet is falsy
+        self.assertIn(", 0%)", output)

@@ -171,3 +171,16 @@ class TestRoute(unittest.TestCase):
         route = Route(driver=self.driver, stops=stops)
         self.assertAlmostEqual(route.total_distance, 5.0)
         self.assertAlmostEqual(route.total_volume_cubic_inches, 1000.0)
+
+    def test_total_volume_cubic_feet(self):
+        """Route.total_volume_cubic_feet converts correctly from cubic inches."""
+        loc = Location("A", 3, 4)
+        # 1728 cu in == exactly 1 cu ft
+        pkg = Package("p1", CUBIC_INCHES_PER_CUBIC_FOOT, self.now + timedelta(hours=24), loc)
+        stop = Stop(
+            package=pkg,
+            arrival_time=self.now + timedelta(hours=1),
+            distance_from_previous=5.0,
+        )
+        route = Route(driver=self.driver, stops=[stop])
+        self.assertAlmostEqual(route.total_volume_cubic_feet, 1.0)
