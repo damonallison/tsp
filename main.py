@@ -12,9 +12,21 @@ from tsp.solver import Solver
 def generate_locations(n: int = 15, seed: int = 42) -> list:
     rng = random.Random(seed)
     names = [
-        "Downtown", "Airport", "Mall", "University", "Hospital",
-        "Stadium", "Harbor", "Park", "Library", "Museum",
-        "Factory", "Hotel", "School", "Church", "Market",
+        "Downtown",
+        "Airport",
+        "Mall",
+        "University",
+        "Hospital",
+        "Stadium",
+        "Harbor",
+        "Park",
+        "Library",
+        "Museum",
+        "Factory",
+        "Hotel",
+        "School",
+        "Church",
+        "Market",
     ]
     return [
         Location(name=names[i % len(names)], x=rng.uniform(0, 50), y=rng.uniform(0, 50))

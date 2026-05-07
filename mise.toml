@@ -4,4 +4,4 @@ uv = "latest"
 
 [tasks.test]
 description = "Run unit tests with pytest"
-run = "pytest tests/ -v"
+run = "uv run pytest tests/ -v"
