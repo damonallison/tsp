@@ -50,7 +50,9 @@ class TestPackage(unittest.TestCase):
 
     def test_valid_package_midrange(self):
         pkg = Package("p1", 5_000.0, self.deadline, self.loc)
-        self.assertAlmostEqual(pkg.size_cubic_feet, 5_000.0 / CUBIC_INCHES_PER_CUBIC_FOOT)
+        self.assertAlmostEqual(
+            pkg.size_cubic_feet, 5_000.0 / CUBIC_INCHES_PER_CUBIC_FOOT
+        )
 
     def test_invalid_package_too_small(self):
         with self.assertRaises(ValueError):
@@ -176,7 +178,9 @@ class TestRoute(unittest.TestCase):
         """Route.total_volume_cubic_feet converts correctly from cubic inches."""
         loc = Location("A", 3, 4)
         # 1728 cu in == exactly 1 cu ft
-        pkg = Package("p1", CUBIC_INCHES_PER_CUBIC_FOOT, self.now + timedelta(hours=24), loc)
+        pkg = Package(
+            "p1", CUBIC_INCHES_PER_CUBIC_FOOT, self.now + timedelta(hours=24), loc
+        )
         stop = Stop(
             package=pkg,
             arrival_time=self.now + timedelta(hours=1),

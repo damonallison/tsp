@@ -51,7 +51,11 @@ class Package:
     destination: Location
 
     def __post_init__(self) -> None:
-        if not (PACKAGE_MIN_CUBIC_INCHES <= self.size_cubic_inches <= PACKAGE_MAX_CUBIC_INCHES):
+        if not (
+            PACKAGE_MIN_CUBIC_INCHES
+            <= self.size_cubic_inches
+            <= PACKAGE_MAX_CUBIC_INCHES
+        ):
             raise ValueError(
                 f"Package size must be between {PACKAGE_MIN_CUBIC_INCHES} and "
                 f"{PACKAGE_MAX_CUBIC_INCHES} cu in, got {self.size_cubic_inches}"
@@ -75,7 +79,11 @@ class Driver:
     depot: Location
 
     def __post_init__(self) -> None:
-        if not (VEHICLE_MIN_CUBIC_FEET <= self.vehicle_size_cubic_feet <= VEHICLE_MAX_CUBIC_FEET):
+        if not (
+            VEHICLE_MIN_CUBIC_FEET
+            <= self.vehicle_size_cubic_feet
+            <= VEHICLE_MAX_CUBIC_FEET
+        ):
             raise ValueError(
                 f"Vehicle size must be between {VEHICLE_MIN_CUBIC_FEET} and "
                 f"{VEHICLE_MAX_CUBIC_FEET} cu ft, got {self.vehicle_size_cubic_feet}"
